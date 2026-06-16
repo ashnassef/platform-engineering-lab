@@ -25,7 +25,10 @@ prohibited_paths=(
 )
 
 for path in "${prohibited_paths[@]}"; do
-  if find . -path "./$path" -o -path "./$path/*" | grep -q .; then
+  if find . \
+    -path './.git' -prune -o \
+    \( -path "./$path" -o -path "./$path/*" \) -print \
+    | grep -q .; then
     fail "prohibited path present: $path"
   fi
 done

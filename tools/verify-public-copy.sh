@@ -82,9 +82,9 @@ trap 'rm -f "$tmp_manifest"' EXIT
 find . -type f \
   -not -path './.git/*' \
   -not -name 'PUBLICATION_MANIFEST.txt' \
-  | sed 's#^\./##' | sort >"$tmp_manifest"
+  | sed 's#^\./##' | LC_ALL=C sort >"$tmp_manifest"
 printf '%s\n' "PUBLICATION_MANIFEST.txt" >>"$tmp_manifest"
-sort -o "$tmp_manifest" "$tmp_manifest"
+LC_ALL=C sort -o "$tmp_manifest" "$tmp_manifest"
 
 if ! diff -u "$tmp_manifest" PUBLICATION_MANIFEST.txt >/dev/null; then
   diff -u "$tmp_manifest" PUBLICATION_MANIFEST.txt >&2 || true

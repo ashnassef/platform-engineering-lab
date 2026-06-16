@@ -1,0 +1,39 @@
+{
+  "uid": "platform-lab",
+  "title": "Platform Engineering Lab",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Queue Depth",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 6 },
+      "targets": [{ "expr": "events_queue_depth" }]
+    },
+    {
+      "type": "stat",
+      "title": "Events Queued",
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 6 },
+      "targets": [{ "expr": "events_queued_total" }]
+    },
+    {
+      "type": "stat",
+      "title": "Jobs Processed",
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 6 },
+      "targets": [{ "expr": "worker_jobs_processed_total" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "API Requests",
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 8 },
+      "targets": [{ "expr": "rate(api_requests_total[1m])" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker Throughput",
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 8 },
+      "targets": [{ "expr": "rate(worker_jobs_processed_total[1m])" }]
+    }
+  ]
+}

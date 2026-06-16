@@ -1,0 +1,68 @@
+# OS and editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Go build outputs and test artifacts
+bin/
+dist/
+build/
+coverage.out
+*.test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Terraform and Proxmox runtime artifacts
+.terraform/
+.platform/
+*.tfstate
+*.tfstate.*
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+*.tfvars
+.terraform.lock.hcl
+
+# Secrets and credentials
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.kubeconfig
+kubeconfig*
+.env
+.env.*
+
+# Logs, caches, archives, and temp files
+*.log
+*.cache
+*.tmp
+*.bak
+*.orig
+*.rej
+*.patch
+*.diff
+*.zip
+*.tar
+*.tgz
+*.gz
+*.xz
+*.7z
+*.rar
+
+# VCS metadata
+.git/
+.svn/
+.hg/

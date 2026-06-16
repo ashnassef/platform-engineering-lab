@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Verify gofmt
+        run: |
+          files="$(git ls-files '*.go')"
+          if [ -n "$(gofmt -l $files)" ]; then
+            echo "gofmt needed for:"
+            gofmt -l $files
+            exit 1
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out
+
+      - name: Remove coverage artifact
+        run: rm -f coverage.out
+
+      - name: Go build
+        run: go build -buildvcs=false ./...
+
+      - name: Validate shell syntax
+        run: |
+          git ls-files -- '*.sh' 'infra/proxmox-lab/platformctl' | xargs -r bash -n
+
+      - name: Verify public copy
+        run: tools/verify-public-copy.sh

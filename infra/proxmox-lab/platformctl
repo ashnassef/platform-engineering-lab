@@ -1,0 +1,2153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LAB_DIR="/root/terraform/proxmox-lab"
+APP_DIR="/root/platform-engineering-lab"
+BACKUP_DIR="/mnt/temp/platform-demo/platform-lab-backup-2026-05-31"
+
+STATE_DIR="${LAB_DIR}/.platform"
+STATE_FILE="${STATE_DIR}/state.json"
+
+PROXMOX_NODE="${PROXMOX_NODE:-dev1}"
+TEMPLATE_VMID="${TEMPLATE_VMID:-100}"
+LAB_BRIDGE="${LAB_BRIDGE:-vmbr1}"
+LAB_SUBNET="${LAB_SUBNET:-10.0.0.0/24}"
+
+SSH_KNOWN_HOSTS="/root/.ssh/proxmox-lab-known_hosts"
+QUEUE_NAME="events:queue"
+
+CONTROL_IP=""
+SSH_USER="dev1"
+WORKER_IPS=()
+
+VERIFY_FAILED=0
+DIAGNOSE_FAILED=0
+
+cd "$LAB_DIR"
+
+usage() {
+  cat <<USAGE
+Usage:
+  platformctl verify
+  platformctl capacity
+  platformctl shape check --workers <count>
+  platformctl build [--resume|--force]
+  platformctl deploy
+  platformctl undeploy
+  platformctl smoke
+  platformctl status [full]
+  platformctl diagnose
+  platformctl repair
+  platformctl view
+  platformctl expose
+  platformctl scale workers <replicas>
+  platformctl drill {status|smoke|kill-api|kill-worker|kill-redis|backlog|idempotency|redis-persistence|drain-node|all}
+  platformctl destroy
+
+Typical controlled demo flow:
+  platformctl verify
+  platformctl capacity
+  platformctl destroy
+  platformctl status
+  platformctl build
+  platformctl deploy
+  platformctl status
+  platformctl smoke
+  platformctl scale workers 3
+  platformctl drill idempotency
+platformctl drill drain-node
+  platformctl drill all
+
+Command meanings:
+  verify      Check whether this host is ready to run/build the lab.
+  capacity    Show host, Proxmox, Terraform, and Kubernetes capacity.
+  shape      Validate a requested lab shape without provisioning it.
+  status      Show what is currently built/running.
+  diagnose    Investigate why something is unhealthy.
+  repair      Try safe recovery steps.
+  scale       Scale the app worker deployment.
+  drain-node  Drain one worker node and prove pod rescheduling.
+USAGE
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+timestamp() {
+  date -Is
+}
+
+check_ok() {
+  printf '\033[32m☑\033[0m %s\n' "$1"
+}
+
+check_no() {
+  printf '\033[31m☐\033[0m %s\n' "$1"
+}
+
+check_warn() {
+  printf '\033[33m☐\033[0m %s\n' "$1"
+}
+
+verify_ok() {
+  check_ok "$1"
+}
+
+verify_no() {
+  check_no "$1"
+  VERIFY_FAILED=1
+}
+
+verify_warn() {
+  check_warn "$1"
+}
+
+diagnose_ok() {
+  check_ok "$1"
+}
+
+diagnose_no() {
+  check_no "$1"
+  DIAGNOSE_FAILED=1
+}
+
+diagnose_warn() {
+  check_warn "$1"
+}
+
+state_init() {
+  mkdir -p "$STATE_DIR"
+
+  if [ ! -f "$STATE_FILE" ]; then
+    jq -n \
+      --arg updated_at "$(timestamp)" \
+      '{
+        status: "new",
+        stage: "none",
+        last_success: "",
+        last_failure: "",
+        message: "",
+        updated_at: $updated_at,
+        control_ip: "",
+        worker_ips: []
+      }' > "$STATE_FILE"
+  fi
+}
+
+state_update() {
+  local stage="$1"
+  local status="$2"
+  local message="${3:-}"
+
+  state_init
+
+  local old_last_success=""
+  local old_last_failure=""
+  local control_ip=""
+  local worker_ips_json="[]"
+
+  old_last_success="$(jq -r '.last_success // ""' "$STATE_FILE" 2>/dev/null || true)"
+  old_last_failure="$(jq -r '.last_failure // ""' "$STATE_FILE" 2>/dev/null || true)"
+
+  control_ip="$(terraform output -raw control_ip 2>/dev/null || true)"
+  worker_ips_json="$(terraform output -json worker_ips 2>/dev/null || printf '[]')"
+
+  if ! printf '%s' "$worker_ips_json" | jq empty >/dev/null 2>&1; then
+    worker_ips_json="[]"
+  fi
+
+  local last_success="$old_last_success"
+  local last_failure="$old_last_failure"
+
+  if [ "$status" = "success" ]; then
+    last_success="$stage"
+    last_failure=""
+  fi
+
+  if [ "$status" = "failed" ]; then
+    last_failure="$stage"
+  fi
+
+  jq -n \
+    --arg status "$status" \
+    --arg stage "$stage" \
+    --arg last_success "$last_success" \
+    --arg last_failure "$last_failure" \
+    --arg message "$message" \
+    --arg updated_at "$(timestamp)" \
+    --arg control_ip "$control_ip" \
+    --argjson worker_ips "$worker_ips_json" \
+    '{
+      status: $status,
+      stage: $stage,
+      last_success: $last_success,
+      last_failure: $last_failure,
+      message: $message,
+      updated_at: $updated_at,
+      control_ip: $control_ip,
+      worker_ips: $worker_ips
+    }' > "${STATE_FILE}.tmp"
+
+  mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
+state_show() {
+  state_init
+  jq . "$STATE_FILE"
+}
+
+run_phase() {
+  local phase="$1"
+  shift
+
+  echo
+  echo "== ${phase} =="
+
+  state_update "$phase" "running" ""
+
+  set +e
+  "$@"
+  local rc="$?"
+  set -e
+
+  if [ "$rc" -eq 0 ]; then
+    state_update "$phase" "success" ""
+    return 0
+  fi
+
+  state_update "$phase" "failed" "exit code ${rc}"
+
+  echo
+  echo "Build failed at: ${phase}"
+  echo "Current state file: ${STATE_FILE}"
+  echo
+  echo "Suggested next actions:"
+  echo "  platformctl status full"
+  echo "  platformctl diagnose"
+  echo "  platformctl build --resume"
+  echo "  platformctl repair"
+  echo "  platformctl destroy"
+  echo
+
+  return "$rc"
+}
+
+require_root() {
+  [ "$(id -u)" = "0" ] || die "Run this as root on the Proxmox host."
+}
+
+require_cmds() {
+  for cmd in terraform kubectl jq curl ssh scp ss awk grep sed timeout ip sysctl free df nproc; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+  done
+}
+
+require_file() {
+  [ -f "$1" ] || die "Missing file: $1"
+}
+
+require_dir() {
+  [ -d "$1" ] || die "Missing directory: $1"
+}
+
+require_lab_files() {
+  require_file "$LAB_DIR/main.tf"
+  require_file "$LAB_DIR/bootstrap-k3s.sh"
+  require_file "$LAB_DIR/deploy-platform.sh"
+  require_file "$LAB_DIR/drill-platform.sh"
+  require_file "$LAB_DIR/view-platform.sh"
+}
+
+require_app_files() {
+  require_dir "$APP_DIR"
+  require_file "$APP_DIR/k8s/redis.yaml"
+  require_file "$APP_DIR/k8s/api.yaml"
+  require_file "$APP_DIR/k8s/worker.yaml"
+  require_file "$APP_DIR/k8s/monitoring.yaml"
+  require_file "$APP_DIR/k8s/ingress.yaml"
+  require_file "$APP_DIR/observability/prometheus/prometheus.yml"
+  require_file "$APP_DIR/observability/grafana/provisioning/datasources/prometheus.yml"
+  require_file "$APP_DIR/observability/grafana/provisioning/dashboards/dashboards.yml"
+  require_file "$APP_DIR/observability/grafana/dashboards/platform-lab.json"
+}
+
+require_image_backups() {
+  require_file "$BACKUP_DIR/platform-engineering-lab-api.tar"
+  require_file "$BACKUP_DIR/platform-engineering-lab-worker.tar"
+}
+
+require_kubeconfig() {
+  require_file "/root/.kube/config"
+}
+
+terraform_has_lab_vms() {
+  terraform state list 2>/dev/null | grep -q '^proxmox_virtual_environment_vm\.lab'
+}
+
+cluster_reachable() {
+  [ -f /root/.kube/config ] || return 1
+  kubectl cluster-info --request-timeout=3s >/dev/null 2>&1
+}
+
+require_cluster() {
+  cluster_reachable || die "Kubernetes is not reachable. Run: platformctl build"
+}
+
+require_nodes_ready() {
+  require_cluster
+
+  local not_ready
+  not_ready="$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 != "Ready" {print $1}' || true)"
+
+  [ -z "$not_ready" ] || die "Some Kubernetes nodes are not Ready: $not_ready"
+}
+
+require_deployment() {
+  require_cluster
+  kubectl get deployment "$1" >/dev/null 2>&1 || die "Missing deployment: $1. Run: platformctl deploy"
+}
+
+require_service() {
+  require_cluster
+  kubectl get service "$1" >/dev/null 2>&1 || die "Missing service: $1. Run: platformctl deploy"
+}
+
+require_platform() {
+  require_nodes_ready
+
+  for deploy in redis api worker prometheus grafana; do
+    require_deployment "$deploy"
+  done
+
+  for svc in redis api worker prometheus grafana; do
+    require_service "$svc"
+  done
+}
+
+require_port_free() {
+  local port="$1"
+
+  if ss -ltn | awk '{print $4}' | grep -Eq "[:.]${port}$"; then
+    die "Port ${port} is already in use. Stop the existing port-forward first."
+  fi
+}
+
+confirm_exact() {
+  local message="$1"
+
+  echo "$message"
+  read -r -p "Type yes to continue: " answer
+  [ "$answer" = "yes" ] || die "Cancelled."
+}
+
+ssh_opts() {
+  echo -o "UserKnownHostsFile=${SSH_KNOWN_HOSTS}" \
+       -o "StrictHostKeyChecking=accept-new" \
+       -o "ConnectTimeout=5"
+}
+
+install_lab_ssh_config() {
+  mkdir -p /root/.ssh
+  touch "$SSH_KNOWN_HOSTS"
+  chmod 700 /root/.ssh
+  chmod 600 "$SSH_KNOWN_HOSTS"
+
+  if ! grep -q "Host 10.0.0.*" /root/.ssh/config 2>/dev/null; then
+    cat >> /root/.ssh/config <<CONFIG
+
+Host 10.0.0.*
+    UserKnownHostsFile ${SSH_KNOWN_HOSTS}
+    StrictHostKeyChecking accept-new
+CONFIG
+    chmod 600 /root/.ssh/config
+  fi
+}
+
+load_outputs() {
+  CONTROL_IP="$(terraform output -raw control_ip)"
+  SSH_USER="$(terraform output -raw ssh_user 2>/dev/null || echo dev1)"
+
+  mapfile -t WORKER_IPS < <(terraform output -json worker_ips | jq -r '.[]')
+
+  [ -n "$CONTROL_IP" ] || die "Terraform output control_ip is empty."
+  [ "${#WORKER_IPS[@]}" -gt 0 ] || die "Terraform output worker_ips is empty."
+}
+
+try_load_outputs() {
+  CONTROL_IP="$(terraform output -raw control_ip 2>/dev/null || true)"
+  SSH_USER="$(terraform output -raw ssh_user 2>/dev/null || echo dev1)"
+
+  mapfile -t WORKER_IPS < <(terraform output -json worker_ips 2>/dev/null | jq -r '.[]' 2>/dev/null || true)
+}
+
+all_node_ips() {
+  printf '%s\n' "$CONTROL_IP"
+  printf '%s\n' "${WORKER_IPS[@]}"
+}
+
+clear_stale_ssh_keys() {
+  install_lab_ssh_config
+
+  for file in "$SSH_KNOWN_HOSTS" /root/.ssh/known_hosts; do
+    touch "$file"
+
+    ssh-keygen -f "$file" -R "$CONTROL_IP" >/dev/null 2>&1 || true
+
+    for ip in "${WORKER_IPS[@]}"; do
+      ssh-keygen -f "$file" -R "$ip" >/dev/null 2>&1 || true
+    done
+  done
+}
+
+wait_for_ssh_node() {
+  local ip="$1"
+
+  echo "Waiting for SSH: ${ip}"
+
+  for i in $(seq 1 90); do
+    if ssh $(ssh_opts) "${SSH_USER}@${ip}" "true" >/dev/null 2>&1; then
+      echo "SSH ready: ${ip}"
+      return 0
+    fi
+
+    sleep 5
+  done
+
+  die "SSH did not become ready on ${ip}"
+}
+
+wait_for_apt_node() {
+  local ip="$1"
+
+  echo "Waiting for cloud-init/apt: ${ip}"
+
+  ssh $(ssh_opts) "${SSH_USER}@${ip}" 'bash -s' <<'REMOTE'
+set -euo pipefail
+
+if command -v cloud-init >/dev/null 2>&1; then
+  timeout 420 sudo cloud-init status --wait >/dev/null 2>&1 || true
+fi
+
+for i in $(seq 1 120); do
+  if sudo fuser /var/lib/dpkg/lock-frontend \
+                /var/lib/dpkg/lock \
+                /var/lib/apt/lists/lock \
+                /var/cache/apt/archives/lock >/dev/null 2>&1; then
+    echo "Waiting for apt lock..."
+    sleep 5
+  else
+    break
+  fi
+done
+
+if sudo fuser /var/lib/dpkg/lock-frontend \
+              /var/lib/dpkg/lock \
+              /var/lib/apt/lists/lock \
+              /var/cache/apt/archives/lock >/dev/null 2>&1; then
+  echo "Apt lock still held after timeout."
+  exit 1
+fi
+
+sudo dpkg --configure -a
+
+for i in $(seq 1 5); do
+  if sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl; then
+    exit 0
+  fi
+
+  echo "apt install failed; retrying..."
+  sleep 10
+done
+
+exit 1
+REMOTE
+
+  echo "apt ready: ${ip}"
+}
+
+terraform_no_delete_plan() {
+  local plan_file="/tmp/platformctl-build.tfplan"
+
+  terraform init -input=false
+  terraform validate
+
+  terraform plan -input=false -out="$plan_file"
+
+  local delete_count
+  delete_count="$(terraform show -json "$plan_file" | jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length')"
+
+  if [ "$delete_count" != "0" ]; then
+    terraform show "$plan_file"
+    die "Build plan includes delete/replace actions. Use 'platformctl destroy' explicitly first."
+  fi
+
+  terraform apply -input=false "$plan_file"
+}
+
+phase_preflight() {
+  require_root
+  require_cmds
+  require_lab_files
+  state_init
+}
+
+phase_terraform_apply() {
+  terraform_no_delete_plan
+}
+
+phase_outputs() {
+  load_outputs
+
+  echo "Control: ${CONTROL_IP}"
+  echo "Workers:"
+  printf '  %s\n' "${WORKER_IPS[@]}"
+}
+
+phase_ssh_ready() {
+  load_outputs
+  clear_stale_ssh_keys
+
+  while read -r ip; do
+    wait_for_ssh_node "$ip"
+  done < <(all_node_ips)
+}
+
+phase_apt_ready() {
+  load_outputs
+
+  while read -r ip; do
+    wait_for_apt_node "$ip"
+  done < <(all_node_ips)
+}
+
+phase_k3s_bootstrap() {
+  ./bootstrap-k3s.sh
+}
+
+phase_nodes_ready() {
+  require_kubeconfig
+  kubectl cluster-info --request-timeout=10s >/dev/null
+
+  kubectl wait --for=condition=Ready nodes --all --timeout=240s
+
+  kubectl get nodes -o wide
+}
+
+deployment_exists() {
+  kubectl --request-timeout=3s get deployment "$1" >/dev/null 2>&1
+}
+
+deployment_ready() {
+  kubectl --request-timeout=3s get deployment "$1" -o json 2>/dev/null \
+    | jq -e '((.spec.replicas // 0) >= 0) and ((.status.readyReplicas // 0) == (.spec.replicas // 0))' >/dev/null 2>&1
+}
+
+service_exists() {
+  kubectl --request-timeout=3s get service "$1" >/dev/null 2>&1
+}
+
+all_deployments_ready() {
+  local deploy
+
+  for deploy in "$@"; do
+    deployment_ready "$deploy" || return 1
+  done
+}
+
+all_services_exist() {
+  local svc
+
+  for svc in "$@"; do
+    service_exists "$svc" || return 1
+  done
+}
+
+nodes_ready_line() {
+  local total
+  local ready
+
+  total="$(kubectl --request-timeout=3s get nodes --no-headers 2>/dev/null | wc -l)"
+  ready="$(kubectl --request-timeout=3s get nodes --no-headers 2>/dev/null | awk '$2 == "Ready" {count++} END {print count + 0}')"
+
+  if [ "$total" -gt 0 ] && [ "$ready" -eq "$total" ]; then
+    check_ok "Kubernetes nodes Ready: ${ready}/${total}"
+  else
+    check_no "Kubernetes nodes Ready: ${ready}/${total}"
+  fi
+}
+
+redis_queue_line() {
+  local len
+
+  if ! deployment_exists redis; then
+    check_no "Redis queue unavailable: deployment/redis missing"
+    return 0
+  fi
+
+  len="$(kubectl exec deploy/redis -- redis-cli LLEN "$QUEUE_NAME" 2>/dev/null || echo unknown)"
+
+  if [ "$len" = "0" ]; then
+    check_ok "Redis queue length: 0"
+  elif printf '%s' "$len" | grep -Eq '^[0-9]+$'; then
+    check_warn "Redis queue length: ${len}"
+  else
+    check_no "Redis queue length unavailable"
+  fi
+}
+
+api_health_line() {
+  local port="18081"
+  local pf_pid=""
+  local health_ok="no"
+  local ready_ok="no"
+
+  if ! service_exists api; then
+    check_no "API health unavailable: service/api missing"
+    return 0
+  fi
+
+  if ss -ltn | awk '{print $4}' | grep -Eq "[:.]${port}$"; then
+    check_warn "API health skipped: local port ${port} is busy"
+    return 0
+  fi
+
+  kubectl port-forward service/api "${port}:8080" >/tmp/platformctl-api-check.log 2>&1 &
+  pf_pid="$!"
+
+  for _ in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+      health_ok="yes"
+      break
+    fi
+    sleep 1
+  done
+
+  if curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null 2>&1; then
+    ready_ok="yes"
+  fi
+
+  kill "$pf_pid" >/dev/null 2>&1 || true
+  wait "$pf_pid" >/dev/null 2>&1 || true
+
+  if [ "$health_ok" = "yes" ] && [ "$ready_ok" = "yes" ]; then
+    check_ok "API health/readiness: ok/ready"
+  else
+    check_no "API health/readiness failed"
+  fi
+}
+
+prometheus_targets_line() {
+  local port="19091"
+  local pf_pid=""
+  local json=""
+  local targets=""
+  local unhealthy=""
+
+  if ! service_exists prometheus; then
+    check_no "Prometheus targets unavailable: service/prometheus missing"
+    return 0
+  fi
+
+  if ss -ltn | awk '{print $4}' | grep -Eq "[:.]${port}$"; then
+    check_warn "Prometheus targets skipped: local port ${port} is busy"
+    return 0
+  fi
+
+  kubectl port-forward service/prometheus "${port}:9090" >/tmp/platformctl-prometheus-check.log 2>&1 &
+  pf_pid="$!"
+
+  for _ in $(seq 1 30); do
+    if json="$(curl -fsS "http://127.0.0.1:${port}/api/v1/targets" 2>/dev/null)"; then
+      break
+    fi
+    sleep 1
+  done
+
+  kill "$pf_pid" >/dev/null 2>&1 || true
+  wait "$pf_pid" >/dev/null 2>&1 || true
+
+  if [ -z "$json" ]; then
+    check_no "Prometheus targets unavailable"
+    return 0
+  fi
+
+  targets="$(printf '%s' "$json" | jq -r '[.data.activeTargets[]? | .labels.job] | unique | join(", ")')"
+  unhealthy="$(printf '%s' "$json" | jq -r '[.data.activeTargets[]? | select(.health != "up") | .labels.job] | unique | join(", ")')"
+
+  if [ -z "$targets" ]; then
+    check_no "Prometheus targets missing"
+  elif [ -z "$unhealthy" ]; then
+    check_ok "Prometheus targets healthy: ${targets}"
+  else
+    check_no "Prometheus unhealthy targets: ${unhealthy}"
+  fi
+}
+
+
+ingress_exists() {
+  kubectl --request-timeout=3s get ingress platform-api >/dev/null 2>&1
+}
+
+ingress_controller_ready() {
+  kubectl -n ingress-nginx --request-timeout=3s get deployment ingress-nginx-controller -o json 2>/dev/null \
+    | jq -e '((.spec.replicas // 0) > 0) and ((.status.readyReplicas // 0) == (.spec.replicas // 0))' >/dev/null 2>&1
+}
+
+ingress_http_node_port() {
+  kubectl -n ingress-nginx get service ingress-nginx-controller -o json 2>/dev/null \
+    | jq -r '.spec.ports[]? | select(.name == "http") | .nodePort' \
+    | head -1
+}
+
+api_ingress_line() {
+  local control_ip=""
+  local node_port=""
+
+  if ! ingress_controller_ready; then
+    check_no "Ingress controller unavailable"
+    return 0
+  fi
+
+  if ! ingress_exists; then
+    check_no "API ingress missing: platform-api"
+    return 0
+  fi
+
+  control_ip="$(terraform output -raw control_ip 2>/dev/null || true)"
+  node_port="$(ingress_http_node_port || true)"
+
+  if [ -z "$control_ip" ] || [ -z "$node_port" ] || [ "$node_port" = "null" ]; then
+    check_no "API ingress route unavailable"
+    return 0
+  fi
+
+  if curl -fsS -H 'Host: platform.local' "http://${control_ip}:${node_port}/healthz" >/dev/null 2>&1; then
+    check_ok "API ingress route: platform.local via ${control_ip}:${node_port}"
+  else
+    check_no "API ingress health check failed"
+  fi
+}
+
+redis_persistence_line() {
+  local appendonly=""
+
+  if ! deployment_exists redis; then
+    check_no "Redis persistence unavailable: deployment/redis missing"
+    return 0
+  fi
+
+  if kubectl get pvc redis-data >/dev/null 2>&1; then
+    check_ok "Redis PVC exists: redis-data"
+  else
+    check_no "Redis PVC missing: redis-data"
+  fi
+
+  appendonly="$(kubectl exec deploy/redis -- redis-cli CONFIG GET appendonly 2>/dev/null | awk 'NR == 2 {print $1}' || true)"
+
+  if [ "$appendonly" = "yes" ]; then
+    check_ok "Redis AOF persistence enabled"
+  else
+    check_no "Redis AOF persistence not enabled"
+  fi
+}
+
+redis_persistence_drill() {
+  require_platform
+
+  local original_replicas
+  local before_len
+  local after_len
+  local redis_pod
+
+  original_replicas="$(kubectl get deployment worker -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)"
+
+  echo
+  echo "== Redis persistence drill =="
+  echo "Original worker replicas: ${original_replicas}"
+
+  trap 'kubectl scale deployment/worker --replicas="'"$original_replicas"'" >/dev/null 2>&1 || true' INT TERM EXIT
+
+  echo
+  echo "Scaling workers to 0 so queue entries remain pending..."
+  kubectl scale deployment/worker --replicas=0
+
+  for _ in $(seq 1 30); do
+    if [ "$(kubectl get pods -l app=worker --no-headers 2>/dev/null | wc -l)" = "0" ]; then
+      break
+    fi
+    sleep 1
+  done
+
+  echo
+  echo "Writing one pending event directly into Redis..."
+  kubectl exec deploy/redis -- redis-cli DEL "$QUEUE_NAME" >/dev/null
+  kubectl exec deploy/redis -- redis-cli RPUSH "$QUEUE_NAME" '{"id":"redis-persistence-drill","status":"queued","created_at":0}' >/dev/null
+
+  before_len="$(kubectl exec deploy/redis -- redis-cli LLEN "$QUEUE_NAME")"
+  echo "Queue length before Redis restart: ${before_len}"
+
+  redis_pod="$(kubectl get pod -l app=redis -o jsonpath='{.items[0].metadata.name}')"
+
+  echo
+  echo "Deleting Redis pod: ${redis_pod}"
+  kubectl delete pod "$redis_pod"
+  kubectl rollout status deployment/redis --timeout=180s
+
+  after_len="$(kubectl exec deploy/redis -- redis-cli LLEN "$QUEUE_NAME")"
+  echo "Queue length after Redis restart: ${after_len}"
+
+  if [ "$before_len" = "1" ] && [ "$after_len" = "1" ]; then
+    check_ok "Redis queue survived pod restart"
+  else
+    check_no "Redis queue did not survive pod restart"
+    return 1
+  fi
+
+  echo
+  echo "Cleaning up drill queue and restoring workers..."
+  kubectl exec deploy/redis -- redis-cli DEL "$QUEUE_NAME" >/dev/null
+  kubectl scale deployment/worker --replicas="$original_replicas"
+
+  if [ "$original_replicas" != "0" ]; then
+    kubectl rollout status deployment/worker --timeout=180s
+  fi
+
+  trap - INT TERM EXIT
+
+  check_ok "Redis persistence drill completed"
+}
+verify() {
+  VERIFY_FAILED=0
+
+  echo
+  echo "== Host readiness =="
+
+  if [ "$(id -u)" = "0" ]; then
+    verify_ok "running as root"
+  else
+    verify_no "not running as root"
+  fi
+
+  for cmd in terraform kubectl jq curl ssh scp ss awk grep sed timeout ip sysctl free df nproc; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      verify_ok "${cmd} installed"
+    else
+      verify_no "${cmd} missing"
+    fi
+  done
+
+  echo
+  echo "== Proxmox readiness =="
+
+  if command -v pvesh >/dev/null 2>&1 && pvesh get "/nodes/${PROXMOX_NODE}/status" >/dev/null 2>&1; then
+    verify_ok "Proxmox API reachable for node ${PROXMOX_NODE}"
+  else
+    verify_no "Proxmox API not reachable for node ${PROXMOX_NODE}"
+  fi
+
+  if command -v qm >/dev/null 2>&1 && qm status "$TEMPLATE_VMID" >/dev/null 2>&1; then
+    verify_ok "template VM ${TEMPLATE_VMID} exists"
+  else
+    verify_no "template VM ${TEMPLATE_VMID} missing"
+  fi
+
+  if ip link show "$LAB_BRIDGE" >/dev/null 2>&1; then
+    verify_ok "lab bridge ${LAB_BRIDGE} exists"
+  else
+    verify_no "lab bridge ${LAB_BRIDGE} missing"
+  fi
+
+  if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" = "1" ]; then
+    verify_ok "IPv4 forwarding enabled"
+  else
+    verify_no "IPv4 forwarding disabled"
+  fi
+
+  if iptables -t nat -S POSTROUTING 2>/dev/null | grep -q "$LAB_SUBNET"; then
+    verify_ok "NAT rule exists for ${LAB_SUBNET}"
+  else
+    verify_warn "NAT rule for ${LAB_SUBNET} not found in iptables"
+  fi
+
+  echo
+  echo "== Lab files =="
+
+  for file in \
+    "$LAB_DIR/main.tf" \
+    "$LAB_DIR/bootstrap-k3s.sh" \
+    "$LAB_DIR/deploy-platform.sh" \
+    "$LAB_DIR/drill-platform.sh" \
+    "$LAB_DIR/view-platform.sh" \
+    "$LAB_DIR/platformctl"; do
+    if [ -f "$file" ]; then
+      verify_ok "$(basename "$file") exists"
+    else
+      verify_no "$(basename "$file") missing"
+    fi
+  done
+
+  if terraform validate >/dev/null 2>&1; then
+    verify_ok "Terraform configuration validates"
+  else
+    verify_no "Terraform configuration does not validate"
+  fi
+
+  echo
+  echo "== App files =="
+
+  if [ -d "$APP_DIR" ]; then
+    verify_ok "app repo exists"
+  else
+    verify_no "app repo missing"
+  fi
+
+  for file in \
+    "$APP_DIR/k8s/redis.yaml" \
+    "$APP_DIR/k8s/api.yaml" \
+    "$APP_DIR/k8s/worker.yaml" \
+    "$APP_DIR/k8s/monitoring.yaml" \
+    "$APP_DIR/k8s/ingress.yaml" \
+    "$APP_DIR/observability/prometheus/prometheus.yml" \
+    "$APP_DIR/observability/grafana/provisioning/datasources/prometheus.yml" \
+    "$APP_DIR/observability/grafana/provisioning/dashboards/dashboards.yml" \
+    "$APP_DIR/observability/grafana/dashboards/platform-lab.json"; do
+    if [ -f "$file" ]; then
+      verify_ok "${file#$APP_DIR/} exists"
+    else
+      verify_no "${file#$APP_DIR/} missing"
+    fi
+  done
+
+  echo
+  echo "== Image backups =="
+
+  for file in \
+    "$BACKUP_DIR/platform-engineering-lab-api.tar" \
+    "$BACKUP_DIR/platform-engineering-lab-worker.tar"; do
+    if [ -f "$file" ]; then
+      verify_ok "$(basename "$file") exists"
+    else
+      verify_no "$(basename "$file") missing"
+    fi
+  done
+
+  echo
+  echo "== SSH readiness =="
+
+  if [ -f /root/.ssh/id_ed25519 ]; then
+    verify_ok "root SSH private key exists"
+  else
+    verify_no "root SSH private key missing"
+  fi
+
+  if [ -f /root/.ssh/id_ed25519.pub ]; then
+    verify_ok "root SSH public key exists"
+  else
+    verify_no "root SSH public key missing"
+  fi
+
+  echo
+  if [ "$VERIFY_FAILED" -eq 0 ]; then
+    check_ok "verify passed"
+    echo
+    echo "Next: platformctl capacity"
+    return 0
+  fi
+
+  check_no "verify failed"
+  echo
+  echo "Fix failed checks before running: platformctl build"
+  return 1
+}
+
+
+shape_plan_summary() {
+  local plan_file="$1"
+
+  terraform show -json "$plan_file" 2>/dev/null | jq -r '
+    def has_action($a): .change.actions | index($a) != null;
+    {
+      create: ([.resource_changes[]? | select(has_action("create"))] | length),
+      update: ([.resource_changes[]? | select(has_action("update"))] | length),
+      delete: ([.resource_changes[]? | select(has_action("delete"))] | length),
+      replace: ([.resource_changes[]? | select((.change.actions | index("create") != null) and (.change.actions | index("delete") != null))] | length)
+    }
+    | "plan summary: create=\(.create), update=\(.update), delete=\(.delete), replace=\(.replace)"
+  ' 2>/dev/null || echo "plan summary unavailable"
+}
+
+shape_check() {
+  require_root
+  require_cmds
+  require_lab_files
+
+  local workers="$1"
+  local min_demo_workers=2
+  local plan_file="/tmp/platformctl-shape-${workers}.tfplan"
+  local log_file="/tmp/platformctl-shape-${workers}.log"
+  local rc=0
+
+  echo
+  echo "== Platform shape check =="
+  echo "Requested shape: 1 control + ${workers:-missing} workers"
+
+  if ! printf '%s' "$workers" | grep -Eq '^[0-9]+$'; then
+    check_no "worker count must be a non-negative integer"
+    return 1
+  fi
+
+  if [ "$workers" -lt "$min_demo_workers" ]; then
+    check_no "shape rejected: demo requires at least ${min_demo_workers} workers"
+    echo
+    echo "Reason:"
+    echo "  The demo needs one Redis/PVC node and one separate worker node that can be safely drained."
+    return 1
+  fi
+
+  check_ok "demo minimum satisfied: ${workers} workers"
+
+  rm -f "$plan_file" "$log_file"
+
+  echo
+  echo "Running Terraform validation and capacity guardrail..."
+  echo "No changes will be applied."
+
+  terraform init -input=false >/dev/null
+  terraform validate >/dev/null
+
+  set +e
+  terraform plan \
+    -input=false \
+    -detailed-exitcode \
+    -var="worker_count=${workers}" \
+    -out="$plan_file" >"$log_file" 2>&1
+  rc="$?"
+  set -e
+
+  if [ "$rc" = "0" ]; then
+    check_ok "shape accepted: already matches Terraform state"
+    shape_plan_summary "$plan_file"
+    echo
+    check_ok "valid lab shape: 1 control + ${workers} workers"
+    return 0
+  fi
+
+  if [ "$rc" = "2" ]; then
+    check_ok "shape accepted: Terraform can converge to this shape"
+    check_warn "shape differs from current Terraform state; no changes were applied"
+    shape_plan_summary "$plan_file"
+    echo
+    check_ok "valid lab shape: 1 control + ${workers} workers"
+    return 0
+  fi
+
+  check_no "shape rejected by Terraform validation or capacity guardrail"
+  echo
+  echo "Terraform/preflight output:"
+  grep -E "Error:|capacity|memory|CPU|disk|VMID|requested|available|insufficient|exceeds|not enough|preflight" "$log_file" | head -80 || sed -n '1,120p' "$log_file"
+  echo
+  echo "Full log:"
+  echo "  $log_file"
+  return 1
+}
+
+shape() {
+  local subcommand="${1:-}"
+  local flag="${2:-}"
+  local workers="${3:-}"
+
+  case "$subcommand" in
+    check)
+      [ "$flag" = "--workers" ] || die "Use: platformctl shape check --workers <count>"
+      [ -n "$workers" ] || die "Use: platformctl shape check --workers <count>"
+      shape_check "$workers"
+      ;;
+    *)
+      die "Unknown shape command. Use: platformctl shape check --workers <count>"
+      ;;
+  esac
+}
+
+capacity() {
+  require_root
+  require_cmds
+
+  echo
+  echo "== Host capacity =="
+
+  local cpu_count
+  local mem_total_mb
+  local mem_available_mb
+  local root_free
+  local lab_free
+
+  cpu_count="$(nproc)"
+  mem_total_mb="$(free -m | awk '/^Mem:/ {print $2}')"
+  mem_available_mb="$(free -m | awk '/^Mem:/ {print $7}')"
+  root_free="$(df -h / | awk 'NR==2 {print $4}')"
+  lab_free="$(df -h "$LAB_DIR" | awk 'NR==2 {print $4}')"
+
+  check_ok "logical CPUs: ${cpu_count}"
+  check_ok "memory total: ${mem_total_mb} MB"
+  check_ok "memory available: ${mem_available_mb} MB"
+  check_ok "root filesystem free: ${root_free}"
+  check_ok "lab filesystem free: ${lab_free}"
+
+  if [ "$cpu_count" -ge 6 ]; then
+    check_ok "CPU capacity suitable for current lab"
+  else
+    check_warn "CPU capacity is tight for multi-node lab"
+  fi
+
+  if [ "$mem_available_mb" -ge 4096 ]; then
+    check_ok "available memory suitable for current lab"
+  else
+    check_warn "available memory is tight"
+  fi
+
+  echo
+  echo "== Proxmox storage =="
+
+  if command -v pvesm >/dev/null 2>&1; then
+    pvesm status || true
+  else
+    check_warn "pvesm command unavailable"
+  fi
+
+  echo
+  echo "== Terraform lab footprint =="
+
+  if terraform_has_lab_vms; then
+    check_ok "Terraform lab VMs currently exist"
+    terraform output || true
+  else
+    check_warn "Terraform lab VMs are not currently built"
+  fi
+
+  echo
+  echo "== Kubernetes capacity =="
+
+  if cluster_reachable; then
+    kubectl get nodes -o wide || true
+
+    local ready_workers
+    ready_workers="$(kubectl get nodes --no-headers | awk '$2 == "Ready" && $3 !~ /control-plane|master/ {count++} END {print count + 0}')"
+
+    if [ "$ready_workers" -gt 0 ]; then
+      check_ok "ready worker nodes: ${ready_workers}"
+      check_ok "safe demo app worker replicas: 1-$((ready_workers * 2))"
+    else
+      check_warn "no ready worker nodes found"
+    fi
+
+    echo
+    echo "Current app deployment requests:"
+    kubectl get deploy redis api worker prometheus grafana 2>/dev/null || true
+  else
+    check_warn "Kubernetes not reachable; cluster capacity unavailable"
+  fi
+
+  echo
+  echo "Capacity note:"
+  echo "  This lab is sized for platform demonstration, not production load testing."
+}
+
+build() {
+  local mode="${1:-normal}"
+
+  case "$mode" in
+    normal|--resume|--force)
+      ;;
+    *)
+      die "Unknown build option: $mode. Use: platformctl build, platformctl build --resume, or platformctl build --force"
+      ;;
+  esac
+
+  if [ "$mode" = "--force" ]; then
+    state_update "build-force" "running" "force build requested"
+  fi
+
+  run_phase "preflight" phase_preflight
+  run_phase "terraform-apply" phase_terraform_apply
+  run_phase "terraform-outputs" phase_outputs
+  run_phase "ssh-ready" phase_ssh_ready
+  run_phase "apt-ready" phase_apt_ready
+
+  if cluster_reachable && [ "$mode" != "--force" ]; then
+    echo
+    echo "== k3s-bootstrap =="
+    echo "Cluster already reachable; skipping bootstrap. Use 'platformctl build --force' to reinstall k3s."
+    state_update "k3s-bootstrap" "success" "cluster already reachable"
+  else
+    run_phase "k3s-bootstrap" phase_k3s_bootstrap
+  fi
+
+  run_phase "nodes-ready" phase_nodes_ready
+
+  echo
+  echo "Build complete."
+  echo "Cluster is ready. App is not deployed yet."
+  echo
+  echo "Next: platformctl deploy"
+}
+
+deploy() {
+  require_root
+  require_cmds
+  require_lab_files
+  require_app_files
+  require_image_backups
+  require_nodes_ready
+
+  state_update "deploy" "running" ""
+
+  set +e
+  ./deploy-platform.sh
+  local rc="$?"
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    state_update "deploy" "failed" "exit code ${rc}"
+    die "Deploy failed. Run: platformctl status full"
+  fi
+
+  state_update "deploy" "success" ""
+
+  echo
+  echo "Deploy complete."
+  echo "Next: platformctl smoke"
+}
+
+undeploy() {
+  require_root
+  require_cmds
+  require_cluster
+
+  confirm_exact "This removes app/monitoring workloads but keeps the VMs and k3s cluster."
+
+  state_update "undeploy" "running" ""
+
+  kubectl delete -f "$APP_DIR/k8s/monitoring.yaml" --ignore-not-found=true || true
+  kubectl delete -f "$APP_DIR/k8s/worker.yaml" --ignore-not-found=true || true
+  kubectl delete -f "$APP_DIR/k8s/api.yaml" --ignore-not-found=true || true
+  kubectl delete -f "$APP_DIR/k8s/redis.yaml" --ignore-not-found=true || true
+
+  kubectl delete configmap prometheus-config --ignore-not-found=true || true
+  kubectl delete configmap grafana-datasources --ignore-not-found=true || true
+  kubectl delete configmap grafana-dashboard-providers --ignore-not-found=true || true
+  kubectl delete configmap grafana-dashboards --ignore-not-found=true || true
+
+  state_update "undeploy" "success" ""
+
+  echo
+  echo "Undeploy complete. Cluster remains built."
+}
+
+smoke() {
+  require_root
+  require_cmds
+  require_platform
+  require_port_free 18080
+
+  ./drill-platform.sh smoke
+}
+
+view() {
+  require_root
+  require_cmds
+  require_platform
+  require_port_free 18080
+  require_port_free 19090
+  require_port_free 13000
+
+  ./view-platform.sh
+}
+
+expose() {
+  require_root
+  require_cmds
+  require_platform
+
+  local control_ip
+  local node_port
+
+  if ! ingress_controller_ready || ! ingress_exists; then
+    die "Ingress is not ready. Run: platformctl deploy"
+  fi
+
+  control_ip="$(terraform output -raw control_ip)"
+  node_port="$(ingress_http_node_port)"
+
+  [ -n "$node_port" ] && [ "$node_port" != "null" ] || die "Could not determine ingress-nginx HTTP NodePort."
+
+  echo
+  echo "== API ingress =="
+  echo "Health:"
+  echo "  curl -H 'Host: platform.local' http://${control_ip}:${node_port}/healthz"
+  echo
+  echo "Events:"
+  echo "  curl -H 'Host: platform.local' -X POST http://${control_ip}:${node_port}/events"
+  echo
+  echo "Testing health endpoint..."
+  curl -fsS -H 'Host: platform.local' "http://${control_ip}:${node_port}/healthz"
+  echo
+
+  echo
+  echo "Dashboards still use:"
+  echo "  platformctl view"
+}
+
+scale() {
+  require_root
+  require_cmds
+  require_platform
+
+  local target="${1:-}"
+  local replicas="${2:-}"
+
+  [ "$target" = "workers" ] || die "Use: platformctl scale workers <replicas>"
+  printf '%s' "$replicas" | grep -Eq '^[0-9]+$' || die "Replica count must be a non-negative integer."
+
+  echo
+  echo "== Scaling app workers =="
+  echo "Setting deployment/worker replicas to ${replicas}"
+
+  kubectl scale deployment/worker --replicas="$replicas"
+
+  if [ "$replicas" != "0" ]; then
+    kubectl rollout status deployment/worker --timeout=180s
+  fi
+
+  kubectl get deployment worker
+  kubectl get pods -l app=worker -o wide || true
+
+  echo
+  echo "Scale complete."
+}
+
+status_short() {
+  state_init
+
+  local state_status
+  local state_stage
+  local last_success
+  local last_failure
+  local updated_at
+  local control_ip
+  local worker_ips
+
+  state_status="$(jq -r '.status // "unknown"' "$STATE_FILE")"
+  state_stage="$(jq -r '.stage // "unknown"' "$STATE_FILE")"
+  last_success="$(jq -r '.last_success // ""' "$STATE_FILE")"
+  last_failure="$(jq -r '.last_failure // ""' "$STATE_FILE")"
+  updated_at="$(jq -r '.updated_at // ""' "$STATE_FILE")"
+
+  echo
+  echo "== Platform checklist =="
+
+  if [ -n "$last_failure" ]; then
+    check_warn "Last platformctl phase: ${state_stage} (${state_status}); last failure: ${last_failure}"
+  elif [ -n "$last_success" ]; then
+    check_ok "Last platformctl phase: ${last_success}"
+  else
+    check_warn "No completed platformctl phase recorded"
+  fi
+
+  [ -n "$updated_at" ] && check_ok "State file updated: ${updated_at}"
+
+  echo
+  echo "== Infrastructure =="
+
+  if terraform_has_lab_vms; then
+    check_ok "Terraform lab VMs exist"
+  else
+    check_no "Terraform lab VMs not built"
+    echo
+    echo "Next: platformctl build"
+    return 0
+  fi
+
+  if control_ip="$(terraform output -raw control_ip 2>/dev/null)" && [ -n "$control_ip" ]; then
+    check_ok "Terraform control output: ${control_ip}"
+  else
+    check_no "Terraform control output missing"
+  fi
+
+  if worker_ips="$(terraform output -json worker_ips 2>/dev/null | jq -r 'join(", ")')" && [ -n "$worker_ips" ]; then
+    check_ok "Terraform worker outputs: ${worker_ips}"
+  else
+    check_no "Terraform worker outputs missing"
+  fi
+
+  if [ -f /root/.kube/config ]; then
+    check_ok "kubeconfig exists"
+  else
+    check_no "kubeconfig missing"
+  fi
+
+  if cluster_reachable; then
+    check_ok "Kubernetes API reachable"
+  else
+    check_no "Kubernetes API not reachable"
+    echo
+    echo "Next: platformctl build --resume"
+    return 0
+  fi
+
+  nodes_ready_line
+
+  echo
+  echo "== Workloads =="
+
+  if all_deployments_ready redis api worker; then
+    check_ok "App deployments ready: redis, api, worker"
+  else
+    check_no "App deployments not fully ready"
+    for deploy in redis api worker; do
+      if deployment_ready "$deploy"; then
+        check_ok "deployment/${deploy}"
+      else
+        check_no "deployment/${deploy}"
+      fi
+    done
+  fi
+
+  if all_deployments_ready prometheus grafana; then
+    check_ok "Monitoring deployments ready: prometheus, grafana"
+  else
+    check_no "Monitoring deployments not fully ready"
+    for deploy in prometheus grafana; do
+      if deployment_ready "$deploy"; then
+        check_ok "deployment/${deploy}"
+      else
+        check_no "deployment/${deploy}"
+      fi
+    done
+  fi
+
+  if all_services_exist redis api worker prometheus grafana; then
+    check_ok "Services exist: redis, api, worker, prometheus, grafana"
+  else
+    check_no "One or more services missing"
+    for svc in redis api worker prometheus grafana; do
+      if service_exists "$svc"; then
+        check_ok "service/${svc}"
+      else
+        check_no "service/${svc}"
+      fi
+    done
+  fi
+
+  echo
+  echo "== Health =="
+
+  api_health_line
+  api_ingress_line
+  redis_queue_line
+  redis_persistence_line
+  prometheus_targets_line
+
+  echo
+  echo "== Next =="
+  if ! deployment_exists api; then
+    echo "platformctl deploy"
+  else
+    echo "platformctl smoke"
+    echo "platformctl capacity"
+    echo "platformctl scale workers 3"
+    echo "platformctl drill idempotency
+platformctl drill drain-node"
+    echo "platformctl drill all"
+  fi
+}
+
+status_full() {
+  status_short
+
+  echo
+  echo "== Raw state file =="
+  state_show || true
+
+  if ! terraform_has_lab_vms; then
+    return 0
+  fi
+
+  echo
+  echo "== Raw Terraform outputs =="
+  terraform output || true
+
+  if ! cluster_reachable; then
+    return 0
+  fi
+
+  echo
+  echo "== Raw nodes =="
+  kubectl get nodes -o wide || true
+
+  echo
+  echo "== Raw pods =="
+  kubectl get pods -o wide || true
+
+  echo
+  echo "== Raw deployments =="
+  kubectl get deploy || true
+
+  echo
+  echo "== Raw services =="
+  kubectl get svc || true
+
+  echo
+  echo "== Raw Redis queue length =="
+  if kubectl get deployment redis >/dev/null 2>&1; then
+    kubectl exec deploy/redis -- redis-cli LLEN "$QUEUE_NAME" || true
+  else
+    echo "redis deployment not found"
+  fi
+
+  echo
+  echo "== Raw Prometheus targets =="
+  if kubectl get service prometheus >/dev/null 2>&1 && ! ss -ltn | awk '{print $4}' | grep -Eq '[:.]19091$'; then
+    kubectl port-forward service/prometheus 19091:9090 >/tmp/platformctl-prom-status.log 2>&1 &
+    local prom_pf="$!"
+    sleep 2
+    curl -fsS "http://127.0.0.1:19091/api/v1/targets" \
+      | jq '.data.activeTargets[]? | {job: .labels.job, health: .health, scrapeUrl: .scrapeUrl}' || true
+    kill "$prom_pf" >/dev/null 2>&1 || true
+    wait "$prom_pf" >/dev/null 2>&1 || true
+  else
+    echo "prometheus service missing or port 19091 busy"
+  fi
+}
+
+status() {
+  require_root
+  require_cmds
+
+  case "${1:-short}" in
+    short)
+      status_short
+      ;;
+    full)
+      status_full
+      ;;
+    *)
+      die "Unknown status mode: $1. Use: platformctl status or platformctl status full"
+      ;;
+  esac
+}
+
+diagnose_node_ssh() {
+  local ip="$1"
+
+  if ssh $(ssh_opts) "${SSH_USER}@${ip}" "true" >/dev/null 2>&1; then
+    diagnose_ok "SSH reachable: ${ip}"
+  else
+    diagnose_no "SSH not reachable: ${ip}"
+    return 0
+  fi
+
+  if ssh $(ssh_opts) "${SSH_USER}@${ip}" "sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1"; then
+    diagnose_warn "apt/dpkg lock active: ${ip}"
+  else
+    diagnose_ok "apt/dpkg unlocked: ${ip}"
+  fi
+
+  if ssh $(ssh_opts) "${SSH_USER}@${ip}" "systemctl is-active --quiet k3s 2>/dev/null || systemctl is-active --quiet k3s-agent 2>/dev/null"; then
+    diagnose_ok "k3s service active: ${ip}"
+  else
+    diagnose_warn "k3s service not active or not installed: ${ip}"
+  fi
+}
+
+diagnose() {
+  DIAGNOSE_FAILED=0
+
+  echo
+  echo "== Diagnosis: host =="
+
+  if [ "$(id -u)" = "0" ]; then
+    diagnose_ok "running as root"
+  else
+    diagnose_no "not running as root"
+  fi
+
+  if [ -f "$STATE_FILE" ]; then
+    diagnose_ok "platform state file exists"
+  else
+    diagnose_warn "platform state file missing"
+  fi
+
+  if terraform validate >/dev/null 2>&1; then
+    diagnose_ok "Terraform configuration validates"
+  else
+    diagnose_no "Terraform configuration validation failed"
+  fi
+
+  echo
+  echo "== Diagnosis: Terraform =="
+
+  if terraform_has_lab_vms; then
+    diagnose_ok "Terraform lab VMs exist in state"
+  else
+    diagnose_warn "Terraform lab VMs not present in state"
+    echo
+    echo "Next: platformctl build"
+    return 0
+  fi
+
+  try_load_outputs
+
+  if [ -n "$CONTROL_IP" ]; then
+    diagnose_ok "control IP output: ${CONTROL_IP}"
+  else
+    diagnose_no "control IP output missing"
+  fi
+
+  if [ "${#WORKER_IPS[@]}" -gt 0 ]; then
+    diagnose_ok "worker IP outputs: ${WORKER_IPS[*]}"
+  else
+    diagnose_no "worker IP outputs missing"
+  fi
+
+  echo
+  echo "== Diagnosis: Proxmox VMs =="
+
+  if command -v qm >/dev/null 2>&1; then
+    local vmid
+    for vmid in $(terraform state show 'proxmox_virtual_environment_vm.lab["tf-k8s-control"]' 2>/dev/null | awk '$1 == "vm_id" && $2 == "=" {print $3; exit}' || true); do
+      if qm status "$vmid" >/dev/null 2>&1; then
+        diagnose_ok "control VM ${vmid}: $(qm status "$vmid" | awk '{print $2}')"
+      else
+        diagnose_no "control VM ${vmid} not found by qm"
+      fi
+    done
+  else
+    diagnose_warn "qm command missing"
+  fi
+
+  echo
+  echo "== Diagnosis: SSH / apt / k3s services =="
+
+  if [ -n "$CONTROL_IP" ]; then
+    diagnose_node_ssh "$CONTROL_IP"
+  fi
+
+  for ip in "${WORKER_IPS[@]}"; do
+    diagnose_node_ssh "$ip"
+  done
+
+  echo
+  echo "== Diagnosis: Kubernetes =="
+
+  if [ -f /root/.kube/config ]; then
+    diagnose_ok "kubeconfig exists"
+    local kube_server
+    kube_server="$(grep 'server:' /root/.kube/config | head -1 | awk '{print $2}' || true)"
+    [ -n "$kube_server" ] && diagnose_ok "kubeconfig server: ${kube_server}"
+  else
+    diagnose_warn "kubeconfig missing"
+  fi
+
+  if cluster_reachable; then
+    diagnose_ok "Kubernetes API reachable"
+    kubectl get nodes -o wide || true
+  else
+    diagnose_no "Kubernetes API not reachable"
+    echo
+    echo "Suggested next actions:"
+    echo "  platformctl repair"
+    echo "  platformctl build --resume"
+    echo "  platformctl build --force"
+    return "$DIAGNOSE_FAILED"
+  fi
+
+  echo
+  echo "== Diagnosis: workloads =="
+
+  for deploy in redis api worker prometheus grafana; do
+    if deployment_ready "$deploy"; then
+      diagnose_ok "deployment/${deploy} ready"
+    elif deployment_exists "$deploy"; then
+      diagnose_no "deployment/${deploy} exists but is not ready"
+      kubectl describe deployment "$deploy" | sed -n '1,80p' || true
+    else
+      diagnose_warn "deployment/${deploy} missing"
+    fi
+  done
+
+  echo
+  echo "== Diagnosis: pods =="
+
+  kubectl get pods -o wide || true
+
+  local bad_pods
+  bad_pods="$(kubectl get pods --no-headers 2>/dev/null | awk '$3 != "Running" && $3 != "Completed" {print $1}' || true)"
+
+  if [ -n "$bad_pods" ]; then
+    diagnose_no "non-running pods found: ${bad_pods}"
+    for pod in $bad_pods; do
+      echo
+      echo "-- describe pod/${pod} --"
+      kubectl describe pod "$pod" | sed -n '1,120p' || true
+    done
+  else
+    diagnose_ok "no non-running pods found"
+  fi
+
+  echo
+  echo "== Diagnosis: recent Kubernetes events =="
+
+  kubectl get events --sort-by=.metadata.creationTimestamp | tail -30 || true
+
+  echo
+  echo "== Diagnosis: queue and monitoring =="
+
+  redis_queue_line
+  redis_persistence_line
+  prometheus_targets_line
+
+  echo
+  if [ "$DIAGNOSE_FAILED" -eq 0 ]; then
+    check_ok "diagnose completed without hard failures"
+  else
+    check_no "diagnose found failures"
+  fi
+
+  return "$DIAGNOSE_FAILED"
+}
+
+
+runtime_image_diagnostics() {
+  local deploy="$1"
+
+  echo
+  echo "== Runtime image diagnostics: deployment/${deploy} =="
+  kubectl get deployment "$deploy" -o wide || true
+  kubectl get rs -l "app=${deploy}" -o wide || true
+  kubectl get pods -l "app=${deploy}" -o wide || true
+
+  echo
+  echo "Recent related events:"
+  kubectl get events --sort-by=.lastTimestamp \
+    | grep -E "pod/${deploy}|deployment/${deploy}|replicaset/${deploy}|ImagePull|BackOff|ErrImagePull" \
+    | tail -40 || true
+}
+
+deployment_runtime_ready() {
+  local deploy="$1"
+  local expected
+  local rows
+  local bad=0
+
+  expected="$(kubectl get deployment "$deploy" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+
+  if [ -z "$expected" ]; then
+    check_no "deployment/${deploy} image could not be determined"
+    runtime_image_diagnostics "$deploy"
+    return 1
+  fi
+
+  echo
+  echo "Checking deployment/${deploy} runtime image..."
+  echo "Expected image: ${expected}"
+
+  if ! kubectl rollout status "deployment/${deploy}" --timeout=60s; then
+    check_no "deployment/${deploy} rollout is not complete"
+    runtime_image_diagnostics "$deploy"
+    return 1
+  fi
+
+  rows="$(
+    kubectl get pods -l "app=${deploy}" -o json 2>/dev/null \
+      | jq -r '.items[] | [
+          .metadata.name,
+          .spec.containers[0].image,
+          (.status.containerStatuses[0].ready // false | tostring),
+          (.status.containerStatuses[0].state.waiting.reason // "")
+        ] | @tsv'
+  )"
+
+  if [ -z "$rows" ]; then
+    check_no "deployment/${deploy} has no pods"
+    runtime_image_diagnostics "$deploy"
+    return 1
+  fi
+
+  while IFS=$'\t' read -r pod image ready waiting; do
+    [ -n "$pod" ] || continue
+
+    echo "  ${pod}: image=${image}, ready=${ready}, waiting=${waiting:-none}"
+
+    if [ "$image" != "$expected" ] || [ "$ready" != "true" ] || [ -n "$waiting" ]; then
+      bad=1
+    fi
+  done <<< "$rows"
+
+  if [ "$bad" != "0" ]; then
+    check_no "deployment/${deploy} pods do not match the expected ready runtime image"
+    runtime_image_diagnostics "$deploy"
+    return 1
+  fi
+
+  check_ok "deployment/${deploy} runtime image ready: ${expected}"
+}
+
+idempotency_drill() {
+  require_root
+  require_cmds
+  require_platform
+
+  local control_ip
+  local node_port
+  local idem
+  local code1
+  local code2
+  local id1
+  local id2
+
+  echo
+  echo "== Idempotency drill =="
+  echo "This first verifies rollout/image state so old pods or ImagePullBackOff do not hide the real result."
+
+  deployment_runtime_ready api || return 1
+  deployment_runtime_ready worker || return 1
+
+  if ! ingress_controller_ready || ! ingress_exists; then
+    check_no "Ingress is not ready"
+    echo "Run: platformctl deploy"
+    return 1
+  fi
+
+  control_ip="$(terraform output -raw control_ip 2>/dev/null || true)"
+  node_port="$(ingress_http_node_port || true)"
+
+  if [ -z "$control_ip" ] || [ -z "$node_port" ] || [ "$node_port" = "null" ]; then
+    check_no "Could not determine API ingress address"
+    return 1
+  fi
+
+  idem="platformctl-idempotency-$(date +%s)"
+
+  rm -f /tmp/platformctl-idempotency-headers-1.txt \
+        /tmp/platformctl-idempotency-headers-2.txt \
+        /tmp/platformctl-idempotency-body-1.json \
+        /tmp/platformctl-idempotency-body-2.json
+
+  echo
+  echo "API route:"
+  echo "  http://${control_ip}:${node_port}/events"
+  echo "Idempotency-Key:"
+  echo "  ${idem}"
+
+  code1="$(
+    curl -sS \
+      -D /tmp/platformctl-idempotency-headers-1.txt \
+      -o /tmp/platformctl-idempotency-body-1.json \
+      -w '%{http_code}' \
+      -H 'Host: platform.local' \
+      -H "Idempotency-Key: ${idem}" \
+      -X POST "http://${control_ip}:${node_port}/events" || true
+  )"
+
+  code2="$(
+    curl -sS \
+      -D /tmp/platformctl-idempotency-headers-2.txt \
+      -o /tmp/platformctl-idempotency-body-2.json \
+      -w '%{http_code}' \
+      -H 'Host: platform.local' \
+      -H "Idempotency-Key: ${idem}" \
+      -X POST "http://${control_ip}:${node_port}/events" || true
+  )"
+
+  id1="$(jq -r '.id // empty' /tmp/platformctl-idempotency-body-1.json 2>/dev/null || true)"
+  id2="$(jq -r '.id // empty' /tmp/platformctl-idempotency-body-2.json 2>/dev/null || true)"
+
+  echo
+  echo "First response:  HTTP ${code1}, id=${id1:-missing}"
+  echo "Second response: HTTP ${code2}, id=${id2:-missing}"
+
+  if grep -qi '^X-Idempotent-Replay:[[:space:]]*true' /tmp/platformctl-idempotency-headers-2.txt; then
+    echo "Second response replay header: true"
+  else
+    echo "Second response replay header: missing"
+  fi
+
+  if [ "$code1" = "202" ] \
+    && [ "$code2" = "200" ] \
+    && [ -n "$id1" ] \
+    && [ "$id1" = "$id2" ] \
+    && grep -qi '^X-Idempotent-Replay:[[:space:]]*true' /tmp/platformctl-idempotency-headers-2.txt; then
+    check_ok "Idempotency drill passed"
+    return 0
+  fi
+
+  check_no "Idempotency drill failed"
+
+  echo
+  echo "First headers:"
+  cat /tmp/platformctl-idempotency-headers-1.txt || true
+  echo
+  echo "First body:"
+  cat /tmp/platformctl-idempotency-body-1.json || true
+  echo
+  echo "Second headers:"
+  cat /tmp/platformctl-idempotency-headers-2.txt || true
+  echo
+  echo "Second body:"
+  cat /tmp/platformctl-idempotency-body-2.json || true
+
+  echo
+  echo "API logs:"
+  kubectl logs deploy/api --tail=80 || true
+
+  return 1
+}
+drain_node_drill() {
+  require_root
+  require_cmds
+  require_platform
+
+  local redis_node=""
+  local target_node=""
+  local candidate=""
+  local new_redis_node=""
+
+  echo
+  echo "== Drain node drill =="
+  echo "This drill avoids the Redis node because Redis uses local-path PVC storage."
+
+  redis_node="$(kubectl get pod -l app=redis -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
+
+  if [ -z "$redis_node" ]; then
+    check_warn "Redis pod has no assigned node; skipping drain to avoid disrupting PVC-bound Redis."
+    return 0
+  fi
+
+  echo "Redis PVC-bound pod is on: ${redis_node}"
+
+  while read -r candidate; do
+    [ -n "$candidate" ] || continue
+
+    if [ "$candidate" != "$redis_node" ]; then
+      target_node="$candidate"
+      break
+    fi
+  done < <(
+    kubectl get nodes --no-headers \
+      | awk '$2 == "Ready" && $3 !~ /control-plane|master/ {print $1}'
+  )
+
+  if [ -z "$target_node" ]; then
+    check_warn "No safe worker node to drain. Redis is on the only available worker node."
+    return 0
+  fi
+
+  echo "Selected safe drain target: ${target_node}"
+
+  trap 'kubectl uncordon "'"$target_node"'" >/dev/null 2>&1 || true' INT TERM EXIT
+
+  echo
+  echo "Draining node: ${target_node}"
+  kubectl drain "$target_node" \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --force \
+    --timeout=120s
+
+  echo
+  echo "Pods after drain:"
+  kubectl get pods -o wide
+
+  echo
+  echo "Waiting for stateless deployments to recover..."
+
+  kubectl rollout status deployment/api --timeout=180s
+  kubectl rollout status deployment/worker --timeout=180s
+  kubectl rollout status deployment/prometheus --timeout=180s
+  kubectl rollout status deployment/grafana --timeout=180s
+
+  echo
+  echo "Checking Redis remained available on its PVC node..."
+
+  kubectl rollout status deployment/redis --timeout=60s
+
+  new_redis_node="$(kubectl get pod -l app=redis -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
+
+  if [ "$new_redis_node" = "$redis_node" ]; then
+    check_ok "Redis stayed on PVC node: ${redis_node}"
+  else
+    check_no "Redis moved or became unscheduled; expected ${redis_node}, got ${new_redis_node:-none}"
+    return 1
+  fi
+
+  echo
+  echo "Uncordoning node: ${target_node}"
+  kubectl uncordon "$target_node"
+
+  trap - INT TERM EXIT
+
+  check_ok "Drain node drill completed without disrupting Redis local-path PVC"
+}
+drill() {
+  require_root
+  require_cmds
+  require_platform
+
+  local drill_name="${1:-}"
+
+  case "$drill_name" in
+    idempotency)
+      idempotency_drill
+      return 0
+      ;;
+    redis-persistence)
+      redis_persistence_drill
+      return 0
+      ;;
+    drain-node)
+      drain_node_drill
+      return 0
+      ;;
+    status|smoke|kill-api|kill-worker|backlog|redis-persistence|all)
+      ;;
+    kill-redis)
+      confirm_exact "This deletes the Redis pod. This demo Redis has no persistent volume, so queued data may be lost."
+      ;;
+    *)
+      die "Unknown drill: ${drill_name}. Use: status, smoke, kill-api, kill-worker, kill-redis, backlog, idempotency, redis-persistence, drain-node, all"
+      ;;
+  esac
+
+  if [ "$drill_name" = "backlog" ] || [ "$drill_name" = "all" ]; then
+    trap 'kubectl scale deployment/worker --replicas=1 >/dev/null 2>&1 || true' EXIT
+  fi
+
+  ./drill-platform.sh "$drill_name"
+}
+
+repair() {
+  require_root
+  require_cmds
+  require_lab_files
+
+  if ! terraform_has_lab_vms; then
+    echo "Platform not built. Nothing to repair."
+    echo
+    echo "Next: platformctl build"
+    return 0
+  fi
+
+  state_update "repair" "running" ""
+
+  load_outputs
+  phase_ssh_ready
+  phase_apt_ready
+
+  echo
+  echo "Restarting k3s services where present..."
+
+  ssh $(ssh_opts) "${SSH_USER}@${CONTROL_IP}" "sudo systemctl restart k3s 2>/dev/null || true"
+
+  for ip in "${WORKER_IPS[@]}"; do
+    ssh $(ssh_opts) "${SSH_USER}@${ip}" "sudo systemctl restart k3s-agent 2>/dev/null || true"
+  done
+
+  echo
+  echo "Refreshing kubeconfig if available..."
+
+  mkdir -p /root/.kube
+
+  if ssh $(ssh_opts) "${SSH_USER}@${CONTROL_IP}" "test -f /etc/rancher/k3s/k3s.yaml"; then
+    ssh $(ssh_opts) "${SSH_USER}@${CONTROL_IP}" "sudo cat /etc/rancher/k3s/k3s.yaml" \
+      | sed "s/127.0.0.1/${CONTROL_IP}/g" > /root/.kube/config
+  fi
+
+  if cluster_reachable; then
+    kubectl wait --for=condition=Ready nodes --all --timeout=180s || true
+    kubectl get nodes -o wide || true
+    state_update "repair" "success" ""
+    echo
+    echo "Repair complete."
+  else
+    state_update "repair" "failed" "cluster still unreachable"
+    die "Repair could not reach Kubernetes. Try: platformctl build --force"
+  fi
+}
+
+destroy() {
+  require_root
+  require_cmds
+  require_lab_files
+
+  confirm_exact "This will destroy the Terraform-managed k3s VMs."
+
+  state_update "destroy" "running" ""
+
+  terraform destroy -auto-approve
+
+  rm -f /root/.kube/config
+
+  state_update "destroy" "success" "Terraform-managed VMs destroyed"
+
+  echo
+  echo "Destroy complete."
+}
+
+case "${1:-}" in
+  verify)
+    verify
+    ;;
+  capacity)
+    capacity
+    ;;
+  shape)
+    shift || true
+    shape "${1:-}" "${2:-}" "${3:-}"
+    ;;
+  build)
+    shift || true
+    build "${1:-normal}"
+    ;;
+  deploy)
+    deploy
+    ;;
+  undeploy)
+    undeploy
+    ;;
+  smoke)
+    smoke
+    ;;
+  view)
+    view
+    ;;
+  expose)
+    expose
+    ;;
+  status)
+    shift || true
+    status "${1:-short}"
+    ;;
+  diagnose)
+    diagnose
+    ;;
+  scale)
+    shift || true
+    scale "${1:-}" "${2:-}"
+    ;;
+  drill)
+    shift || true
+    drill "${1:-status}"
+    ;;
+  repair)
+    repair
+    ;;
+  destroy)
+    destroy
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
